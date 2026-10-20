@@ -15,6 +15,8 @@ your **Claude subscription** (a `claude setup-token` token). An Anthropic API ke
 - **Which chats the bot sees is decided by Telegram only** — in *Settings → Telegram Business →
   Chatbots* you choose the chats. There is no allowlist in the code.
 - Runs with long polling: no domain, webhook or open port needed.
+- **Relay mode** (`AGENT_MODE=relay`): answers customers inside the chat of a bot whose webhook belongs to
+  another backend (the VDL Market mini app bot); see [Relay mode](#relay-mode-answering-in-the-mini-app-bots-chat).
 - Optional **VDL Market search** (`VDL_API_KEY`): when someone asks for a product or a dish, the bot sends
   its reply and then up to 3 cards (photo, name, price, seller, "Ochish" button) from the VDL Market mini app.
 
@@ -31,6 +33,69 @@ Claude answers every message with JSON: `{"reply": "...", "search": {"q": "lavas
   (Russian/English variants for those languages). API errors are logged as `VDL search failed`.
 - In PREVIEW mode the search still runs (read-only) and the cards are shown in the log, nothing is sent.
 - `VDL_API_KEY` is removed from the environment of the `claude` process, like the other secrets.
+
+## Relay mode: answering in the mini app bot's chat
+
+Use `AGENT_MODE=relay` when customers should get answers **inside the chat of a bot whose webhook is owned by
+another backend** (for example the VDL Market mini app bot built with Lovable). Telegram allows only one receiver
+per bot token, so the agent does not poll in this mode. Instead:
+
+1. The mini app backend keeps its webhook and handles `/start`, mini app buttons, orders and so on, as before.
+2. For updates it does not handle itself — private messages that are not commands — it forwards the **raw
+   Telegram update JSON** to the agent: `POST https://<railway-domain>/relay` with
+   `Authorization: Bearer <RELAY_SECRET>`. The agent answers `200` immediately.
+3. The agent writes the reply (plus up to 3 VDL cards) and sends it to the customer with the same bot token
+   via the Bot API (`sendMessage` / `sendPhoto`, no business connection).
+
+Details:
+- Everyone who writes to the bot is answered (in AUTO-SEND mode); history is kept per chat (`direct:<chat_id>`).
+- Customer `/start` and other commands are ignored by the agent: they belong to the mini app backend.
+  If the backend also forwards the owner's `/pause`, `/resume`, `/status`, `/start`, they work as usual.
+- Wrong or missing secret → `401`; a body that is not a Telegram update → `400`; `GET /health` → `200`.
+- Owner alerts (usage limit, errors) are sent to `OWNER_ID` through this bot, so the owner must have started it.
+
+### Railway setup for relay mode
+
+1. Variables:
+   ```
+   AGENT_MODE=relay
+   RELAY_SECRET=<python -c "import secrets; print(secrets.token_urlsafe(32))">
+   TELEGRAM_BOT_TOKEN=<the mini app bot's token, the same one the backend uses>
+   OWNER_ID=<your Telegram ID>
+   CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat...
+   VDL_API_KEY=...
+   AUTO_SEND=false
+   ```
+2. Service → *Settings → Networking → Generate Domain* (Railway sets `PORT`; the agent listens on it).
+3. Logs should show `Relay mode: listening on port ...`.
+4. Give the backend `AGENT_RELAY_URL=https://<railway-domain>/relay` and the same `RELAY_SECRET`.
+5. When the previews in the log look good, set `AUTO_SEND=true`.
+
+### Backend change (e.g. Lovable, Supabase Edge Function webhook)
+
+```ts
+// After parsing the incoming Telegram update in the existing webhook handler:
+const msg = update.message;
+const forwardToAgent =
+  msg && msg.chat?.type === "private" && !msg.web_app_data && !(msg.text ?? "").startsWith("/");
+
+if (forwardToAgent) {
+  try {
+    await fetch(Deno.env.get("AGENT_RELAY_URL")!, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${Deno.env.get("AGENT_RELAY_SECRET")}`,
+      },
+      body: JSON.stringify(update), // the raw update, unchanged
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch (e) {
+    console.error("agent relay failed", e);
+  }
+  // Do not send any other automatic reply to this message, or the customer gets two answers.
+}
+```
 
 ## Behaviour
 
@@ -151,6 +216,7 @@ All tests run offline: a fake Telegram session and a fake `claude` executable ar
 | `assistant/store.py` | History, duplicates and runtime state in `data/` |
 | `assistant/service.py` | Reply logic, product cards |
 | `assistant/handlers.py` | aiogram router |
+| `assistant/relay.py` | HTTP relay server for relay mode (`POST /relay`) |
 | `profile.md` | Facts about you and your writing style |
 | `Dockerfile`, `railway.json`, `.dockerignore` | Railway deployment |
 | `tests/` | Offline tests |

@@ -1,4 +1,8 @@
-"""aiogram router: business updates go to the Assistant, owner commands in the private chat."""
+"""aiogram router.
+
+business mode: business updates go to the Assistant; owner commands in the private chat.
+relay mode: private messages to the bot (forwarded by the mini app backend) are answered too.
+"""
 from __future__ import annotations
 
 from aiogram import Bot, F, Router
@@ -15,9 +19,14 @@ STRANGER_START_TEXT = (
 )
 
 
+def _is_command(message: Message) -> bool:
+    return bool(message.text and message.text.startswith("/"))
+
+
 def build_router(assistant: Assistant) -> Router:
     router = Router(name="assistant")
     owner_id = assistant.settings.owner_id
+    relay = assistant.settings.relay_mode
 
     @router.business_connection()
     async def on_business_connection(connection: BusinessConnection) -> None:
@@ -31,7 +40,7 @@ def build_router(assistant: Assistant) -> Router:
     async def on_start(message: Message) -> None:
         if message.from_user is not None and message.from_user.id == owner_id:
             await message.answer(assistant.start_text())
-        else:
+        elif not relay:  # in relay mode /start belongs to the mini app backend
             await message.answer(STRANGER_START_TEXT)
 
     @router.message(Command("pause"), F.chat.type == "private", F.from_user.id == owner_id)
@@ -48,5 +57,11 @@ def build_router(assistant: Assistant) -> Router:
     async def on_status(message: Message) -> None:
         await message.answer(assistant.status_text())
 
-    # Anything else sent directly to the bot (by the owner or anyone else) is silently ignored.
+    if relay:
+
+        @router.message(F.chat.type == "private", lambda message: not _is_command(message))
+        async def on_direct_message(message: Message, bot: Bot) -> None:
+            await assistant.on_direct_message(bot, message)
+
+    # Anything else sent directly to the bot is silently ignored.
     return router

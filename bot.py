@@ -132,10 +132,29 @@ async def run_bot(settings: Settings) -> int:
             log.warning("The assistant starts PAUSED (send /resume to the bot)")
         if not profile_is_filled(read_profile(settings.profile_path)):
             log.warning("%s is not filled in yet; replies will be generic", settings.profile_path)
-        await dp.start_polling(bot, allowed_updates=ALLOWED_UPDATES)
+        if settings.relay_mode:
+            await serve_relay(dp, bot, settings)
+        else:
+            await dp.start_polling(bot, allowed_updates=ALLOWED_UPDATES)
         return 0
     finally:
         await bot.session.close()
+
+
+async def serve_relay(dp, bot, settings: Settings) -> None:
+    """Relay mode: no polling (the mini app backend owns the webhook); updates arrive at POST /relay."""
+    from aiohttp import web
+
+    from assistant.relay import build_relay_app
+
+    runner = web.AppRunner(build_relay_app(dp, bot, settings.relay_secret or ""))
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", settings.port).start()
+    log.info("Relay mode: listening on port %s (POST /relay, GET /health); Telegram polling is off", settings.port)
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
 
 
 def main(argv: Optional[List[str]] = None) -> int:

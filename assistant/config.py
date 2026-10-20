@@ -36,7 +36,13 @@ SETTING_KEYS = (
     "PROFILE_PATH",
     "VDL_API_KEY",
     "VDL_API_URL",
+    "AGENT_MODE",
+    "RELAY_SECRET",
+    "PORT",
 )
+
+AGENT_MODES = ("business", "relay")
+MIN_RELAY_SECRET_LENGTH = 24
 
 DEFAULT_VDL_API_URL = "https://vdl-market.lovable.app/api/public/agent/search"
 
@@ -71,7 +77,14 @@ class Settings:
     profile_path: Path
     vdl_api_key: Optional[str] = field(default=None, repr=False)
     vdl_api_url: str = DEFAULT_VDL_API_URL
+    agent_mode: str = "business"
+    relay_secret: Optional[str] = field(default=None, repr=False)
+    port: int = 8080
     from_environment: bool = False
+
+    @property
+    def relay_mode(self) -> bool:
+        return self.agent_mode == "relay"
 
     @property
     def vdl_search_enabled(self) -> bool:
@@ -188,6 +201,18 @@ def load_settings(
     if not vdl_url.startswith("https://"):
         raise fail("VDL_API_URL must start with https://")
 
+    agent_mode = get("AGENT_MODE").lower() or "business"
+    if agent_mode not in AGENT_MODES:
+        raise fail(f"AGENT_MODE must be one of {', '.join(AGENT_MODES)}")
+    relay_secret = get("RELAY_SECRET") or None
+    if relay_secret and (len(relay_secret) < MIN_RELAY_SECRET_LENGTH or re.search(r"\s", relay_secret)):
+        raise fail(f"RELAY_SECRET must be at least {MIN_RELAY_SECRET_LENGTH} characters without spaces")
+    if agent_mode == "relay" and require_telegram and not relay_secret:
+        raise fail("RELAY_SECRET is required when AGENT_MODE=relay")
+    port = integer("PORT", 8080, 1)
+    if port > 65535:
+        raise fail("PORT must be at most 65535")
+
     def path(key: str, default: str) -> Path:
         value = Path(os.path.expanduser(get(key) or default))
         return value if value.is_absolute() else base_dir / value
@@ -211,6 +236,9 @@ def load_settings(
         profile_path=path("PROFILE_PATH", "profile.md"),
         vdl_api_key=vdl_key,
         vdl_api_url=vdl_url,
+        agent_mode=agent_mode,
+        relay_secret=relay_secret,
+        port=port,
         from_environment=source is not None,
     )
 

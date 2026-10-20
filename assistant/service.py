@@ -32,6 +32,8 @@ log = logging.getLogger("assistant")
 TELEGRAM_CHUNK = 4000
 OWNER_ALERT_INTERVAL = 600.0
 SEARCH_LIMIT = 3
+# Pseudo connection id for chats with the bot itself (relay mode); history keys become "direct:<chat>".
+DIRECT = "direct"
 MAX_CARDS = 3
 NOT_FOUND_TEXT = {
     "uz": "Hozircha topilmadi, boshqa so'z bilan qidirib ko'ring",
@@ -202,8 +204,13 @@ def not_found_text(language: Optional[str]) -> str:
     return NOT_FOUND_TEXT.get(language or "uz", NOT_FOUND_TEXT["uz"])
 
 
-async def send_cards(bot: Bot, chat_id: int, items: List[dict], business_connection_id: str) -> int:
-    """Send up to MAX_CARDS product/dish cards on behalf of the business account. Returns how many were sent."""
+async def send_cards(
+    bot: Bot, chat_id: int, items: List[dict], business_connection_id: Optional[str]
+) -> int:
+    """Send up to MAX_CARDS product/dish cards (on behalf of the business account when an id is given).
+
+    Returns how many were sent.
+    """
     sent = 0
     for item in items[:MAX_CARDS]:
         caption = card_caption(item)
@@ -327,7 +334,32 @@ class Assistant:
         language = detect_language(text) or self.history.last_language(conn_id, chat_id)
         chat_name = _sender_name(message)
         self.history.add(conn_id, chat_id, "other", chat_name, text, language, now)
+        return await self._respond(bot, conn_id, chat_id, chat_name, text, language, key)
 
+    async def on_direct_message(self, bot: Bot, message: Message) -> Outcome:
+        """A customer wrote to the bot itself (relay mode: forwarded by the mini app backend)."""
+        outcome = await self._handle_direct(bot, message)
+        self.outcomes.append(outcome)
+        return outcome
+
+    async def _handle_direct(self, bot: Bot, message: Message) -> Outcome:
+        chat_id = message.chat.id
+        if not self.seen.first_time(f"{DIRECT}:{chat_id}:{message.message_id}"):
+            return Outcome.DUPLICATE
+        if message.from_user is not None and message.from_user.is_bot:
+            return Outcome.IGNORED_BOT
+        text = describe(message)
+        if text is None:
+            return Outcome.UNSUPPORTED
+        language = detect_language(text) or self.history.last_language(DIRECT, chat_id)
+        chat_name = _sender_name(message)
+        self.history.add(DIRECT, chat_id, "other", chat_name, text, language, self.clock())
+        key = HistoryStore.key(DIRECT, chat_id)
+        return await self._respond(bot, DIRECT, chat_id, chat_name, text, language, key)
+
+    async def _respond(
+        self, bot: Bot, conn_id: str, chat_id: int, chat_name: str, text: str, language: Optional[str], key: str
+    ) -> Outcome:
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
             blocked = self._blocked(key)
@@ -412,6 +444,42 @@ class Assistant:
             self._preview(preview)
             return blocked
 
+        business_id: Optional[str] = None
+        if preview.connection_id != DIRECT:
+            denied = await self._verify_connection(bot, preview)
+            if denied is not None:
+                return denied
+            business_id = preview.connection_id
+
+        try:
+            if preview.has_reply:
+                for chunk in _chunks(preview.reply):
+                    await bot.send_message(
+                        chat_id=preview.chat_id, text=chunk, business_connection_id=business_id
+                    )
+                self.history.add(
+                    preview.connection_id, preview.chat_id, "owner", "You", preview.reply, None, self.clock()
+                )
+            if preview.search:
+                if preview.cards:
+                    count = await send_cards(bot, preview.chat_id, preview.cards, business_id)
+                    shown = "; ".join(card_summary(item) for item in preview.cards[:count])
+                    sent_text = f"[sent VDL Market cards: {shown}]"
+                else:
+                    sent_text = not_found_text(preview.language)
+                    await bot.send_message(
+                        chat_id=preview.chat_id, text=sent_text, business_connection_id=business_id
+                    )
+                self.history.add(
+                    preview.connection_id, preview.chat_id, "owner", "You", sent_text, None, self.clock()
+                )
+        except TelegramAPIError as exc:
+            log.error("Sending reply to chat %s failed: %s", preview.chat_id, exc)
+            return Outcome.ERROR
+        log.info("Reply sent to chat %s (%s)", preview.chat_id, preview.chat_name)
+        return Outcome.SENT
+
+    async def _verify_connection(self, bot: Bot, preview: Preview) -> Optional[Outcome]:
         # Fresh lookup (never the cache): the owner may have revoked access meanwhile.
         try:
             connection = await bot.get_business_connection(business_connection_id=preview.connection_id)
@@ -431,34 +499,7 @@ class Assistant:
             preview.note = f"not sent: {reason}"
             self._preview(preview)
             return Outcome.PERMISSION_DENIED
-
-        try:
-            if preview.has_reply:
-                for chunk in _chunks(preview.reply):
-                    await bot.send_message(
-                        chat_id=preview.chat_id, text=chunk, business_connection_id=preview.connection_id
-                    )
-                self.history.add(
-                    preview.connection_id, preview.chat_id, "owner", "You", preview.reply, None, self.clock()
-                )
-            if preview.search:
-                if preview.cards:
-                    count = await send_cards(bot, preview.chat_id, preview.cards, preview.connection_id)
-                    shown = "; ".join(card_summary(item) for item in preview.cards[:count])
-                    sent_text = f"[sent VDL Market cards: {shown}]"
-                else:
-                    sent_text = not_found_text(preview.language)
-                    await bot.send_message(
-                        chat_id=preview.chat_id, text=sent_text, business_connection_id=preview.connection_id
-                    )
-                self.history.add(
-                    preview.connection_id, preview.chat_id, "owner", "You", sent_text, None, self.clock()
-                )
-        except TelegramAPIError as exc:
-            log.error("Sending reply to chat %s failed: %s", preview.chat_id, exc)
-            return Outcome.ERROR
-        log.info("Reply sent to chat %s (%s)", preview.chat_id, preview.chat_name)
-        return Outcome.SENT
+        return None
 
     async def _notify_owner(self, bot: Bot, text: str, *, force: bool = False) -> None:
         now = self.clock()
@@ -482,7 +523,8 @@ class Assistant:
 
     def status_text(self) -> str:
         mode = "AUTO-SEND" if self.settings.auto_send else "PREVIEW: replies are only shown in the logs"
-        lines = [f"Mode: {mode}", f"State: {'paused' if self.state.paused else 'running'}"]
+        source = "relay (customers write to this bot)" if self.settings.relay_mode else "Telegram Business chats"
+        lines = [f"Mode: {mode}", f"Chats: {source}", f"State: {'paused' if self.state.paused else 'running'}"]
         limit_until = self.state.limit_until
         if limit_until and limit_until > self.clock():
             lines.append(
@@ -510,12 +552,22 @@ class Assistant:
             f"Rejim: {mode}",
             f"Holat: {state}",
             "",
-            "Qanday ulanadi:",
-            "1. Telegram → Settings → Telegram Business → Chatbots",
-            "2. Shu botning username'ini kiriting",
-            "3. Bot qaysi chatlarni ko'rishini tanlang",
-            "4. Javob berish ruxsatini yoqing",
-            "(Telegram Premium kerak)",
+        ]
+        if self.settings.relay_mode:
+            lines += [
+                "Ish tartibi: bot chati (relay rejimi)",
+                "Mijozlar shu botga yozgan xabarlarni mini app serveri menga uzatadi, men esa shu bot nomidan javob beraman.",
+            ]
+        else:
+            lines += [
+                "Qanday ulanadi:",
+                "1. Telegram → Settings → Telegram Business → Chatbots",
+                "2. Shu botning username'ini kiriting",
+                "3. Bot qaysi chatlarni ko'rishini tanlang",
+                "4. Javob berish ruxsatini yoqing",
+                "(Telegram Premium kerak)",
+            ]
+        lines += [
             "",
             "Buyruqlar:",
             "/pause — javob berishni to'xtatish",
@@ -524,7 +576,7 @@ class Assistant:
             "",
             "Bilib qo'ying:",
         ]
-        if minutes > 0:
+        if minutes > 0 and not self.settings.relay_mode:
             lines.append(f"• Chatda o'zingiz yozsangiz, o'sha chatda {minutes} daqiqa jim turaman.")
         lines += [
             "• Pul, qarz, uchrashuv va rejalarga rozilik bermayman, va'da qilmayman.",
