@@ -22,9 +22,21 @@ _UZ_LATIN_WORDS = {
     "qalaysiz", "qayerda", "qayerdasan", "bugun", "ertaga", "kerak", "xop", "bopti", "zor",
     "hozir", "keyin", "men", "sen", "siz", "yoq", "nimaga", "qachon", "uyda", "ketdim",
     "kelaman", "boraman", "qilaman", "bormi", "yoqmi", "kerakmi", "qancha", "qanchadan", "narxi",
+    "bor", "necha", "pul", "narx", "qaerda", "qayerga", "qaerga", "buyurtma", "yetkazib", "dostavka",
+    "olmoqchiman", "bermoqchiman", "mahsulot", "bormikan", "bo'lsa", "bolsa", "iltimos", "marhamat",
+    "ha", "yo'q", "mumkin", "mumkinmi", "arzon", "qimmat", "kafolat", "tekin", "naqd",
+}
+# Clear English evidence; short Latin text without any of these has no reliable language.
+_EN_WORDS = {
+    "hi", "hello", "hey", "ok", "okay", "thanks", "thank", "you", "your", "are", "is", "the", "a", "an", "i",
+    "do", "does", "have", "how", "much", "what", "where", "when", "which", "who", "why", "price", "free",
+    "please", "can", "could", "will", "would", "my", "me", "we", "it", "it's", "in", "on", "at", "for", "to",
+    "of", "and", "or", "not", "no", "yes", "there", "this", "that", "with", "want", "need", "tonight",
+    "today", "tomorrow", "see", "bye", "good", "morning", "evening", "available", "delivery", "order",
 }
 _UZ_LATIN_SUFFIXES = (
     "misan", "misiz", "mizmi", "yapsan", "yapman", "yapti", "yapmiz", "asizmi", "ganman", "dingmi",
+    "moqchiman", "moqchimiz", "moqchi", "laymi", "larmi",
 )
 
 _APOS_CLASS = "[" + re.escape(APOSTROPHES) + "]"
@@ -63,7 +75,10 @@ def detect_language(text: str) -> Optional[str]:
     for word in re.findall(r"[a-z]+", stripped):
         if word in _UZ_LATIN_WORDS or word.endswith(_UZ_LATIN_SUFFIXES):
             return "uz"
-    return "en"
+    english = re.findall(r"[a-z']+", text.lower())
+    if any(word in _EN_WORDS for word in english):
+        return "en"
+    return None  # e.g. "Somsa", "Dior parfyum": not enough evidence either way
 
 
 LANGUAGE_NAMES = {"uz": "Uzbek", "ru": "Russian", "en": "English"}
